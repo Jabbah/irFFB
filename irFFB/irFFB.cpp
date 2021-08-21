@@ -17,12 +17,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "irFFB.h"
 #include "Settings.h"
-#include "jetseat.h"
-#include "fan.h"
-#include "hidguardian.h"
 #include "public.h"
-#include "yaml_parser.h"
 #include "vjoyinterface.h"
+#include "SharedFileOut.h"
+#include <math.h>
 
 #define MAX_LOADSTRING 100
 
@@ -60,9 +58,6 @@ LogiLedData logiLedData;
 DIEFFESCAPE logiEscape;
 
 Settings settings;
-JetSeat *jetseat;
-Fan *fan;
-HidGuardian *hidGuardian;
 
 float firc6[] = {
     0.1295867f, 0.2311436f, 0.2582509f, 0.1923936f, 0.1156718f, 0.0729534f
@@ -88,7 +83,7 @@ understeerCoefs usteerCoefs[] = {
 
 int force = 0;
 volatile float suspForce = 0.0f; 
-volatile float yawForce[DIRECT_INTERP_SAMPLES];
+volatile float yawForce = 0.0f;
 __declspec(align(16)) volatile float suspForceST[DIRECT_INTERP_SAMPLES];
 bool onTrack = false, stopped = true, deviceChangePending = false, logiWheel = false;
 
@@ -108,28 +103,72 @@ LARGE_INTEGER freq;
 int vjDev = 1;
 FFB_DATA ffbPacket;
 
-float *floatvarptr(const char *data, const char *name) {
-    int idx = irsdk_varNameToIndex(name);
-    if (idx >= 0)
-        return (float *)(data + irsdk_getVarHeaderEntry(idx)->offset);
-    else
-        return nullptr;
+template <typename T, unsigned S>
+inline unsigned arraysize(const T(&v)[S])
+{
+    return S;
 }
 
-int *intvarptr(const char *data, const char *name) {
-    int idx = irsdk_varNameToIndex(name);
-    if (idx >= 0)
-        return (int *)(data + irsdk_getVarHeaderEntry(idx)->offset);
-    else
-        return nullptr;
+
+struct SMElement
+{
+    HANDLE hMapFile;
+    unsigned char* mapFileBuffer;
+};
+
+SMElement m_graphics;
+SMElement m_physics;
+SMElement m_static;
+
+void initPhysics()
+{
+    TCHAR szName[] = TEXT("Local\\acpmf_physics");
+    m_physics.hMapFile = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(SPageFilePhysics), szName);
+    if (!m_physics.hMapFile)
+    {
+        MessageBoxA(GetActiveWindow(), "CreateFileMapping failed", "ACCS", MB_OK);
+    }
+    m_physics.mapFileBuffer = (unsigned char*)MapViewOfFile(m_physics.hMapFile, FILE_MAP_READ, 0, 0, sizeof(SPageFilePhysics));
+    if (!m_physics.mapFileBuffer)
+    {
+        MessageBoxA(GetActiveWindow(), "MapViewOfFile failed", "ACCS", MB_OK);
+    }
 }
 
-bool *boolvarptr(const char *data, const char *name) {
-    int idx = irsdk_varNameToIndex(name);
-    if (idx >= 0)
-        return (bool *)(data + irsdk_getVarHeaderEntry(idx)->offset);
-    else
-        return nullptr;
+void initGraphics()
+{
+    TCHAR szName[] = TEXT("Local\\acpmf_graphics");
+    m_graphics.hMapFile = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(SPageFileGraphic), szName);
+    if (!m_graphics.hMapFile)
+    {
+        MessageBoxA(GetActiveWindow(), "CreateFileMapping failed", "ACCS", MB_OK);
+    }
+    m_graphics.mapFileBuffer = (unsigned char*)MapViewOfFile(m_graphics.hMapFile, FILE_MAP_READ, 0, 0, sizeof(SPageFileGraphic));
+    if (!m_graphics.mapFileBuffer)
+    {
+        MessageBoxA(GetActiveWindow(), "MapViewOfFile failed", "ACCS", MB_OK);
+    }
+}
+
+void initStatic()
+{
+    TCHAR szName[] = TEXT("Local\\acpmf_static");
+    m_static.hMapFile = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(SPageFileStatic), szName);
+    if (!m_static.hMapFile)
+    {
+        MessageBoxA(GetActiveWindow(), "CreateFileMapping failed", "ACCS", MB_OK);
+    }
+    m_static.mapFileBuffer = (unsigned char*)MapViewOfFile(m_static.hMapFile, FILE_MAP_READ, 0, 0, sizeof(SPageFileStatic));
+    if (!m_static.mapFileBuffer)
+    {
+        MessageBoxA(GetActiveWindow(), "MapViewOfFile failed", "ACCS", MB_OK);
+    }
+}
+
+void dismiss(SMElement element)
+{
+    UnmapViewOfFile(element.mapFileBuffer);
+    CloseHandle(element.hMapFile);
 }
 
 // Thread that reads the wheel, writes to vJoy and updates the DI effect
@@ -232,7 +271,7 @@ DWORD WINAPI readWheelThread(LPVOID lParam) {
         }
 
         pforce.lOffset = ffbMag;
-        pforce.lOffset += (int)d;
+        //pforce.lOffset += (int)d;
 
         if (pforce.lOffset > DI_MAX)
             pforce.lOffset = DI_MAX;
@@ -258,239 +297,24 @@ DWORD WINAPI readWheelThread(LPVOID lParam) {
 
 }
 
-// Calculate FFB samples for the direct modes
-DWORD WINAPI directFFBThread(LPVOID lParam) {
-
-    UNREFERENCED_PARAMETER(lParam);
-    int16_t mag;
-
-    float s;
-    int r;
-    __declspec(align(16)) float prod[12];
-    float lastSuspForce = 0, lastYawForce = 0;
-    LARGE_INTEGER start;
-
-    while (true) {
-
-        bool use360 = settings.getUse360ForDirect();
-
-        // Signalled when force has been updated
-        WaitForSingleObject(ffbEvent, INFINITE);
-
-        if (
-            settings.getFfbType() != FFBTYPE_DIRECT_FILTER &&
-            settings.getFfbType() != FFBTYPE_DIRECT_FILTER_720
-        )
-            continue;
-        
-        if (((ffbPacket.data[0] & 0xF0) >> 4) != vjDev)
-            continue;
-        
-        mag = (ffbPacket.data[3] << 8) + ffbPacket.data[2];
-
-        QueryPerformanceCounter(&start);
-
-        // sign extend
-        force = mag;
-
-        s = (float)force;
-
-        if (!use360)
-            s += scaleTorque(suspForce);
-
-        if (settings.getFfbType() == FFBTYPE_DIRECT_FILTER_720) {
-
-            prod[0] = s * firc12[0];
-
-            _asm {
-                movaps xmm0, xmmword ptr prod
-                movaps xmm1, xmmword ptr prod+16
-                movaps xmm2, xmmword ptr prod+32
-                addps xmm0, xmm1
-                addps xmm0, xmm2
-                haddps xmm0, xmm0
-                haddps xmm0, xmm0
-                cvttss2si eax, xmm0
-                mov dword ptr r, eax
-            }
-
-            if (use360)
-                r += scaleTorque(lastSuspForce + (suspForceST[0] - lastSuspForce) / 2.0f);
-
-            r += scaleTorque(lastYawForce + (yawForce[0] - lastYawForce) / 2.0f);
-
-            setFFB(r);
-
-            for (int i = 1; i < DIRECT_INTERP_SAMPLES * 2 - 1; i++) {
-
-                prod[i] = s * firc12[i];
-
-                _asm {
-                    movaps xmm0, xmmword ptr prod
-                    movaps xmm1, xmmword ptr prod + 16
-                    movaps xmm2, xmmword ptr prod + 32
-                    addps xmm0, xmm1
-                    addps xmm0, xmm2
-                    haddps xmm0, xmm0
-                    haddps xmm0, xmm0
-                    cvttss2si eax, xmm0
-                    mov dword ptr r, eax
-                }
-
-                int idx = (i - 1) >> 1;
-                bool odd = i & 1;
-
-                if (use360)
-                    r +=
-                        scaleTorque(
-                            odd ?
-                                suspForceST[idx] :
-                                suspForceST[idx]  + (suspForceST[idx + 1] - suspForceST[idx]) / 2.0f
-                        );
-
-                r += 
-                    scaleTorque(
-                        odd ?
-                            yawForce[idx] :
-                            yawForce[idx] + (yawForce[idx + 1] - yawForce[idx]) / 2.0f
-                    );
-
-                sleepSpinUntil(&start, 0, 1380 * i);
-                setFFB(r);
-
-            }
-
-            prod[DIRECT_INTERP_SAMPLES * 2 - 1] = s * firc12[DIRECT_INTERP_SAMPLES * 2 - 1];
-            _asm {
-                movaps xmm0, xmmword ptr prod
-                movaps xmm1, xmmword ptr prod + 16
-                movaps xmm2, xmmword ptr prod + 32
-                addps xmm0, xmm1
-                addps xmm0, xmm2
-                haddps xmm0, xmm0
-                haddps xmm0, xmm0
-                cvttss2si eax, xmm0
-                mov dword ptr r, eax
-            }
-
-            if (use360)
-                r += scaleTorque(suspForceST[DIRECT_INTERP_SAMPLES - 1]);
-
-            r += scaleTorque(yawForce[DIRECT_INTERP_SAMPLES - 1]);
-
-            sleepSpinUntil(&start, 0, 1380 * (DIRECT_INTERP_SAMPLES * 2 - 1));
-            setFFB(r);
-
-            lastSuspForce = suspForceST[DIRECT_INTERP_SAMPLES - 1];
-            lastYawForce = yawForce[DIRECT_INTERP_SAMPLES - 1];
-
-            continue;
-
-        }
-            
-        prod[0] = s * firc6[0];
-        r = (int)(prod[0] + prod[1] + prod[2] + prod[3] + prod[4] + prod[5]) +
-                scaleTorque(yawForce[0]);
-
-        if (use360)
-            r += scaleTorque(suspForceST[0]);
-
-        setFFB(r);
-
-        for (int i = 1; i < DIRECT_INTERP_SAMPLES; i++) {
-
-            prod[i] = s * firc6[i];
-            r = (int)(prod[0] + prod[1] + prod[2] + prod[3] + prod[4] + prod[5]) +
-                    scaleTorque(yawForce[i]);
-
-            if (use360)
-                r += scaleTorque(suspForceST[i]);
-
-            sleepSpinUntil(&start, 2000, 2760 * i);
-            setFFB(r);
-
-        }
-
-    }
-
-    return 0;
-
-}
-
 void resetForces() {
     debug(L"Resetting forces");
     suspForce = 0;
+    yawForce = 0;
     for (int i = 0; i < DIRECT_INTERP_SAMPLES; i++) {
         suspForceST[i] = 0;
-        yawForce[i] =  0;
     }
     force = 0;
     setFFB(0);
 }
 
 boolean getCarName() {
-
-    char buf[64];
-    const char *ptr;
-    int len = -1, carIdx = -1;
-
-    car[0] = 0;
-
-    // Get car idx
-    if (!parseYaml(irsdk_getSessionInfoStr(), "DriverInfo:DriverCarIdx:", &ptr, &len))
-        return false;
-
-    if (len < 0 || len > sizeof(buf) - 1)
-        return false;
-    
-    memcpy(buf, ptr, len);
-    buf[len] = 0;
-    carIdx = atoi(buf);
-
-    // Get car path
-    sprintf_s(buf, "DriverInfo:Drivers:CarIdx:{%d}CarPath:", carIdx);
-    if (!parseYaml(irsdk_getSessionInfoStr(), buf, &ptr, &len))
-        return false;
-    if (len < 0 || len > sizeof(car) - 1)
-        return false;
-
-    memcpy(car, ptr, len);
-    car[len] = 0;
-
-    return true;
-      
+    return false;
 }
 
 float getCarRedline() {
 
-    char buf[64];
-    const char *ptr;
-    int len = -1;
-
-    if (parseYaml(irsdk_getSessionInfoStr(), "DriverInfo:DriverCarRedLine:", &ptr, &len)) {
-
-        if (len < 0 || len > sizeof(buf) - 1)
-            return 8000.0f;
-        
-        memcpy(buf, ptr, len);
-        buf[len] = 0;
-        return strtof(buf, NULL);
-    }
-    
     return 8000.0f;
-
-}
-
-understeerCoefs *getCarUsteerCoeffs(char *car) {
-
-    for (int i = 0; i < sizeof(usteerCoefs) / sizeof(usteerCoefs[0]); i++)
-        if (!strcmp(car, usteerCoefs[i].car)) {
-            debug(L"We have understeer coeffs for car %s", car);
-            return &usteerCoefs[i];
-        }
-
-    debug(L"No understeer coeffs for car %s", car);
-    return nullptr;
 
 }
 
@@ -504,8 +328,8 @@ void clippingReport() {
 
 }
 
-void logiRpmLed(float *rpm, float redline) {
-    
+void logiRpmLed(float* rpm, float redline) {
+
     logiLedData.rpmData.rpm = *rpm / (redline * 0.90f);
     logiLedData.rpmData.rpmFirstLed = 0.65f;
     logiLedData.rpmData.rpmRedLine = 1.0f;
@@ -513,6 +337,151 @@ void logiRpmLed(float *rpm, float redline) {
     ffdevice->Escape(&logiEscape);
 
 }
+
+// Calculate FFB samples for the direct modes
+DWORD WINAPI directFFBThread(LPVOID lParam) {
+
+    UNREFERENCED_PARAMETER(lParam);
+    int16_t mag;
+
+    float s;
+    int r;
+    float lastSuspForce = 0, lastYawForce = 0;
+    float yaw = 0.0f;
+    float gLat = 0.0f;
+
+    float maxValue = 10000.0f;
+
+    constexpr auto PI = 3.14159265;
+
+    while (true) {
+
+        // Signalled when force has been updated
+        WaitForSingleObject(ffbEvent, INFINITE);
+        
+        if (((ffbPacket.data[0] & 0xF0) >> 4) != vjDev)
+            continue;
+        
+        mag = (ffbPacket.data[3] << 8) + ffbPacket.data[2];
+        force = mag;
+
+        s = (float)force;
+
+        SPageFilePhysics* pfPhys = (SPageFilePhysics*)m_physics.mapFileBuffer;
+        SPageFileGraphic* pfGfx = (SPageFileGraphic*)m_graphics.mapFileBuffer;
+
+        if (onTrack && pfGfx->isInPit) {
+            debug(L"No longer on track");
+            onTrack = false;
+            setOnTrackStatus(onTrack);
+            resetForces();
+            clippingReport();
+        }
+        else if (!onTrack && !pfGfx->isInPit) {
+            debug(L"Now on track");
+            onTrack = true;
+            setOnTrackStatus(onTrack);
+        }
+
+        yaw = 0.0f;
+        gLat = 0.0f;
+
+        float bumpsFactor = settings.getBumpsFactor();
+        float sopFactor = (settings.getSopFactor() * maxValue / 100.0f);
+        float gLatFactor = (settings.getGLatFactor() * maxValue / 100.0f);
+        float sopOffset = settings.getSopOffset();
+
+        if (pfPhys->speedKmh > 2.0f) {
+
+            if (pfPhys->speedKmh > 5.0f) {
+
+                float halfMaxForce = maxValue / 1.2f;
+                float r = pfPhys->localVelocity[0] / pfPhys->localVelocity[2];
+                float sa, asa, ar = abs(r);
+
+                if (pfPhys->localVelocity[2] < 0.0f)
+                    r = -r;
+
+                if (ar > 1.0f) {
+                    sa = csignf(0.785f, r);
+                    asa = 0.785f;
+                    yaw = minf(maxf(sa * sopFactor, -halfMaxForce), halfMaxForce);
+                }
+                else {
+                    sa = 0.78539816339745f * r + 0.273f * r * (1.0f - ar);
+                    asa = abs(sa);
+                    if (asa > sopOffset) {
+                        sa -= csignf(sopOffset, sa);
+                        yaw =
+                            minf(
+                                maxf(
+                                    sa * (1.785f - asa) * sopFactor,
+                                    -halfMaxForce
+                                ),
+                                halfMaxForce
+                            );
+                    }
+                }
+
+                r = -pfPhys->accG[0] / 2.0f;
+                ar = abs(r);
+
+                if (pfPhys->localVelocity[2] < 0.0f)
+                    r = -r;
+
+                if (ar > 1.0f) {
+                    sa = csignf(0.785f, r);
+                    asa = 0.785f;
+                    gLat = minf(maxf(sa * gLatFactor, -halfMaxForce), halfMaxForce);
+                }
+                else {
+                    sa = 0.78539816339745f * r + 0.273f * r * (1.0f - ar);
+                    asa = abs(sa);
+                    gLat =
+                        minf(
+                            maxf(
+                                sa * (1.785f - asa) * gLatFactor,
+                                -halfMaxForce
+                            ),
+                            halfMaxForce
+                        );
+                }
+
+            }
+
+            stopped = false;
+
+        }
+        else
+            stopped = true;
+
+        float forces = ((yaw + gLat) * settings.getScaleFactor() + s) / maxValue;
+
+        float sigma;
+        float sign = 1.0f;
+        if (forces < 0.0f)
+            sign = -1.0f;
+
+        float gLong = pfPhys->accG[2];
+
+        if (gLong < 0)
+            gLong *= 0.5;
+
+        gLong *= settings.getGLatFactor() / -260.0f;
+
+        forces = fabsf(forces);
+        sigma = 2.0f / (1.0f + pow(2.718f, -15.0f * forces)) - 1.0f;
+        forces = sign * (((1.0f - sigma) * forces) + (sigma * (pow(forces, 1.0f / (1.0f + gLong)))));
+
+        r = (int)(forces * maxValue);
+
+        setFFB(r);
+    }
+
+    return 0;
+
+}
+
 
 void deviceChange() {
 
@@ -571,52 +540,20 @@ int APIENTRY wWinMain(
 
     UNREFERENCED_PARAMETER(hPrevInstance);
 
-    if (StrStrW(lpCmdLine, CMDLINE_HGSVC)) {
-
-        SERVICE_TABLE_ENTRYW SvcDispatchTable[] = {
-            { SVCNAME, (LPSERVICE_MAIN_FUNCTION)HidGuardian::SvcMain },
-            { NULL, NULL }
-        };
-
-        if (!StartServiceCtrlDispatcherW(SvcDispatchTable)) {
-            HidGuardian::svcReportError(L"Failed to start service ctrl dispatcher");
-            exit(1);
-        }
-
-        exit(0);
-
-    }
-
     globalMutex = CreateMutex(NULL, false, L"Global\\irFFB_Mutex");
 
     if (GetLastError() == ERROR_ALREADY_EXISTS)
         exit(0);
 
+    initPhysics();
+    initGraphics();
+    initStatic();
+
     INITCOMMONCONTROLSEX ccEx;
 
-    HANDLE handles[1];
     char *data = nullptr;
     bool irConnected = false;
     MSG msg;
-
-    float *swTorque = nullptr, *swTorqueST = nullptr, *steer = nullptr, *steerMax = nullptr;
-    float *speed = nullptr, *throttle = nullptr, *rpm = nullptr;
-    float *LFshockDeflST = nullptr, *RFshockDeflST = nullptr, *CFshockDeflST = nullptr;
-    float *LRshockDeflST = nullptr, *RRshockDeflST = nullptr;
-    float *vX = nullptr, *vY = nullptr;
-    float *latAccel = nullptr, *yawRate = nullptr;
-    float LFshockDeflLast = -10000, RFshockDeflLast = -10000, CFshockDeflLast = -10000;
-    float LRshockDeflLast = -10000, RRshockDeflLast = -10000;
-    bool *isOnTrack = nullptr;
-    int *trackSurface = nullptr, *gear = nullptr;
-
-    bool inGarage = false;
-    int numHandles = 0, dataLen = 0, lastGear = 0;
-    int STnumSamples = 0, STmaxIdx = 0, lastTrackSurface = -1;
-    float halfSteerMax = 0, lastTorque = 0, lastSuspForce = 0, redline;
-    float yaw = 0.0f, yawFilter[DIRECT_INTERP_SAMPLES];
-
-    understeerCoefs *usCoefs;
 
     ccEx.dwICC = ICC_WIN95_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES;
     ccEx.dwSize = sizeof(ccEx);
@@ -664,19 +601,6 @@ int APIENTRY wWinMain(
     if (!InitInstance(hInstance, nCmdShow))
         return FALSE;
 
-    hidGuardian = HidGuardian::init(GetCurrentProcessId());
-    if (StrStrW(lpCmdLine, CMDLINE_HGINST))
-        hidGuardian->install();
-    else if (StrStrW(lpCmdLine, CMDLINE_HGREPAIR))
-        hidGuardian->repairService();
-
-    fan = Fan::init();
-    jetseat = JetSeat::init();
-    if (!jetseat) {
-        DeleteMenu(GetMenu(mainWnd), ID_SETTINGS_JETSEAT, MF_BYCOMMAND);
-        DrawMenuBar(mainWnd);
-    }
-
     memset(car, 0, sizeof(car));
     setCarStatus(car);
     setConnectedStatus(false);
@@ -691,7 +615,6 @@ int APIENTRY wWinMain(
 
     enumDirectInput();
 
-    LARGE_INTEGER start;
     QueryPerformanceFrequency(&freq);
 
     initVJD();
@@ -706,492 +629,33 @@ int APIENTRY wWinMain(
 
     debug(L"Init complete, entering mainloop");
 
+    setConnectedStatus(true);
+
+    setCarStatus(nullptr);
+
+    int bRet;
     while (TRUE) {
 
-        DWORD res;
-        const irsdk_header *hdr = NULL;
-
-        if (
-            irsdk_startup() && (hdr = irsdk_getHeader()) &&
-            hdr->status & irsdk_stConnected && hdr->bufLen != dataLen && hdr->bufLen != 0
-        ) {
-
-            debug(L"New iRacing session");
-
-            handles[0] = hDataValidEvent;
-            numHandles = 1;
-
-            if (data != NULL)
-                free(data);
-
-            dataLen = irsdk_getHeader()->bufLen;
-            data = (char *)malloc(dataLen);
-            setConnectedStatus(true);
-
-            if (getCarName() && settings.getUseCarSpecific()) {
-                setCarStatus(car);
-                settings.readSettingsForCar(car);
-            }
-            else 
-                setCarStatus(nullptr);
-    
-            redline = getCarRedline();
-             debug(L"Redline is %d rpm", (int)redline);
-            
-            usCoefs = getCarUsteerCoeffs(car);
-            EnableWindow(settings.getUndersteerWnd()->trackbar, usCoefs != nullptr);
-            EnableWindow(settings.getUndersteerWnd()->value, usCoefs != nullptr);
-            EnableWindow(settings.getUndersteerOffsetWnd()->trackbar, usCoefs != nullptr);
-            EnableWindow(settings.getUndersteerOffsetWnd()->value, usCoefs != nullptr);
-
-            // Inform iRacing of the maxForce setting
-            irsdk_broadcastMsg(irsdk_BroadcastFFBCommand, irsdk_FFBCommand_MaxForce, (float)settings.getMaxForce());
-
-            swTorque = floatvarptr(data, "SteeringWheelTorque");
-            swTorqueST = floatvarptr(data, "SteeringWheelTorque_ST");
-            steer = floatvarptr(data, "SteeringWheelAngle");
-            steerMax = floatvarptr(data, "SteeringWheelAngleMax");
-            speed = floatvarptr(data, "Speed");
-            throttle = floatvarptr(data, "Throttle");
-            rpm = floatvarptr(data, "RPM");
-            gear = intvarptr(data, "Gear");
-            isOnTrack = boolvarptr(data, "IsOnTrack");
-
-            trackSurface = intvarptr(data, "PlayerTrackSurface");
-            vX = floatvarptr(data, "VelocityX");
-            vY = floatvarptr(data, "VelocityY");
-
-            latAccel = floatvarptr(data, "LatAccel");
-            yawRate = floatvarptr(data, "YawRate");
-
-            RFshockDeflST = floatvarptr(data, "RFshockDefl_ST");
-            LFshockDeflST = floatvarptr(data, "LFshockDefl_ST");
-            LRshockDeflST = floatvarptr(data, "LRshockDefl_ST");
-            RRshockDeflST = floatvarptr(data, "RRshockDefl_ST");
-            CFshockDeflST = floatvarptr(data, "CFshockDefl_ST");
-
-            int swTorqueSTidx = irsdk_varNameToIndex("SteeringWheelTorque_ST");
-            STnumSamples = irsdk_getVarHeaderEntry(swTorqueSTidx)->count;
-            STmaxIdx = STnumSamples - 1;
-
-            lastTorque = 0.0f;
-            onTrack = false;
-            resetForces();
-            irConnected = true;
-            timeBeginPeriod(1);
-
-        }
-
-        res = MsgWaitForMultipleObjects(numHandles, handles, FALSE, 1000, QS_ALLINPUT);
-
-        QueryPerformanceCounter(&start);
-
-        if (numHandles > 0 && res == numHandles - 1 && irsdk_getNewData(data)) {
-
-            if (onTrack && !*isOnTrack) {
-                debug(L"No longer on track");
-                onTrack = false;
-                setOnTrackStatus(onTrack);
-                lastTorque = lastSuspForce = 0.0f;
-                resetForces();
-                fan->setManualSpeed();
-                clippingReport();
-            }
-
-            else if (!onTrack && *isOnTrack) {
-                debug(L"Now on track");
-                onTrack = true;
-                setOnTrackStatus(onTrack);
-                RFshockDeflLast = LFshockDeflLast = 
-                    LRshockDeflLast = RRshockDeflLast = 
-                        CFshockDeflLast = -10000.0f;
-                clippedSamples = samples = lastGear = 0;
-                memset(yawFilter, 0, DIRECT_INTERP_SAMPLES * sizeof(float));
-            }
-
-            if (*trackSurface != lastTrackSurface) {
-                debug(L"Track surface is now: %d", *trackSurface);
-                lastTrackSurface = *trackSurface;
-            }
-
-            if (jetseat && jetseat->isEnabled()) {
-                if (*isOnTrack && *rpm > 0.0f) {
-                    jetseat->startEngineEffect();
-                    jetseat->updateEngineEffect(*rpm * 100.0f / redline);
-                }
-                else                
-                    jetseat->stopEngineEffect();
-            }
-
-            if (ffdevice && logiWheel)
-                logiRpmLed(rpm, redline);
-
-            yaw = 0.0f;
-
-            if (*speed > 2.0f) {
-            
-                float bumpsFactor = settings.getBumpsFactor();
-                float sopFactor = settings.getSopFactor();
-                float sopOffset = settings.getSopOffset();
-
-                bool use360  = settings.getUse360ForDirect();
-                int ffbType = settings.getFfbType();
-
-                if (*speed > 5.0f) {
-
-                    float halfMaxForce = (float)(settings.getMaxForce() >> 1);
-                    float r = *vY / *vX;
-                    float sa, asa, ar = abs(r);
-                    float reqSteer, uSteer;
-
-                    if (*vX < 0.0f)
-                        r = -r;
-
-                    if (ar > 1.0f) {
-                        sa = csignf(0.785f, r);
-                        asa = 0.785f;
-                        yaw = minf(maxf(sa * sopFactor, -halfMaxForce), halfMaxForce);
-                    }
-                    else {
-                        sa = 0.78539816339745f * r + 0.273f * r * (1.0f - ar);
-                        asa = abs(sa);
-                        if (asa > sopOffset) {
-                            sa -= csignf(sopOffset, sa);
-                            yaw =
-                                minf(
-                                    maxf(
-                                        sa * (2.0f - asa) * sopFactor,
-                                        -halfMaxForce
-                                    ),
-                                    halfMaxForce
-                                );
-                        }
-                    }
-                    
-                    if (jetseat && jetseat->isEnabled() && asa > sopOffset)
-                        jetseat->yawEffect(sa);
-
-                    if (usCoefs != nullptr && settings.getUndersteerFactor() > 0.0f) {
-
-                        reqSteer = abs((*yawRate * usCoefs->yawRateMult) / *speed + *latAccel / usCoefs->latAccelDiv);
-                        uSteer = minf(abs(*steer) - reqSteer - USTEER_MIN_OFFSET - settings.getUndersteerOffset(), 1.0f);
-
-                        if (uSteer > 0.0f)
-                            yaw -= uSteer * settings.getUndersteerFactor() * USTEER_MULTIPLIER * *swTorque;
-
-                    }
-
-                }
-
-                if (
-                    LFshockDeflST != nullptr && RFshockDeflST != nullptr && bumpsFactor != 0.0f
-                ) {
-
-                    if (LFshockDeflLast != -10000.0f) {
-
-                        if (ffbType != FFBTYPE_DIRECT_FILTER || use360) {
-
-                            __asm {
-                                mov eax, LFshockDeflST
-                                mov ecx, RFshockDeflST
-                                movups xmm0, xmmword ptr [eax]
-                                movups xmm1, xmmword ptr [ecx]
-                                // xmm2 = LFdefl[0,1,2,3]
-                                movaps xmm2, xmm0
-                                // xmm3 = RFdefl[0,1,2,3]
-                                movaps xmm3, xmm1
-                                // xmm0 = LFdefl[-,0,1,2]
-                                pslldq xmm0, 4
-                                movss xmm4, LFshockDeflLast
-                                // xmm1 = RFdefl[-,0,1,2]
-                                pslldq xmm1, 4
-                                movss xmm5, RFshockDeflLast
-                                // xmm0 = LFdefl[LFlast,0,1,2]
-                                movss xmm0, xmm4
-                                // xmm6 = LFdefl[0,1,2,3]
-                                movaps xmm6, xmm2
-                                // xmm2 = LFdefl[0] - LFlast, LFdefl[1] - LFdefl[0], ...
-                                subps xmm2, xmm0
-                                // xmm1 = RFdefl[RFlast,0,1,2]
-                                movss xmm1, xmm5
-                                // xmm7 = RFdefl[0,1,2,3]
-                                movaps xmm7, xmm3
-                                // xmm3 = RFdefl[0] - RFlast, RFdefl[1] - RFdefl[0], ...
-                                subps xmm3, xmm1
-                                // xmm4 = LFdefl[3,4,5]
-                                movups xmm4, xmmword ptr [eax + 12]
-                                // xmm1 = LFdefl[4,5]
-                                movlps xmm1, qword ptr [eax + 16]
-                                // xmm1 = LFdefl[4] - LFdefl[3], LFdefl[5] - LFdefl[4]
-                                subps xmm1, xmm4
-                                // xmm5 = RFdefl[3,4,5]
-                                movups xmm5, xmmword ptr [ecx + 12]
-                                // xmm0 = RFdefl[4,5]
-                                movlps xmm0, qword ptr [ecx + 16]
-                                // xmm2 = delta[0,1,2,3]
-                                subps xmm2, xmm3
-                                // xmm0 = RFdefl[4] - RFdefl[3], RFdefl[5] - RFdefl[4]
-                                subps xmm0, xmm5
-                                // xmm3 = susTexFactor
-                                movss xmm3, bumpsFactor
-                                // xmm1 = delta[4,5]
-                                subps xmm1, xmm0
-                                unpcklps xmm3, xmm3
-                                unpcklps xmm3, xmm3
-                                // xmm2 = delta[0,1,2,3] * bumpsFactor
-                                mulps xmm2, xmm3
-                                // xmm1 = delta[4,5] * bumpsFactor
-                                mulps xmm1, xmm3
-                                // write
-                                movaps xmmword ptr suspForceST[0], xmm2
-                                movlps qword ptr suspForceST[16], xmm1
-                            }
-        
-                        }
-                        else {
-                            suspForce = 
-                                (
-                                    (LFshockDeflST[STmaxIdx] - LFshockDeflLast) -
-                                    (RFshockDeflST[STmaxIdx] - RFshockDeflLast)
-                                ) * bumpsFactor * 0.25f;
-                        }
-
-                        if (jetseat && jetseat->isEnabled()) {
-                            float LFd = LFshockDeflST[STmaxIdx] - LFshockDeflLast;
-                            float RFd = RFshockDeflST[STmaxIdx] - RFshockDeflLast;
-
-                            if (LFd > 0.0025f || RFd > 0.0025f)
-                                jetseat->fBumpEffect(LFd * 220.0f, RFd * 220.0f);
-                        }
-                        
-                    }
-
-                    RFshockDeflLast = RFshockDeflST[STmaxIdx];
-                    LFshockDeflLast = LFshockDeflST[STmaxIdx];
-
-                }
-                else if (CFshockDeflST != nullptr && bumpsFactor != 0) {
-
-                    if (CFshockDeflLast != -10000.0f) {
-                    
-                        if (ffbType != FFBTYPE_DIRECT_FILTER || use360)
-                            __asm {
-                                mov eax, CFshockDeflST
-                                movups xmm0, xmmword ptr[eax]
-                                // xmm3 = bumpsFactor
-                                movss xmm3, bumpsFactor
-                                // xmm2 = CFdefl[0,1,2,3]
-                                movaps xmm2, xmm0
-                                // xmm0 = CFdefl[-,1,2,3]
-                                pslldq xmm0, 4
-                                movss xmm4, CFshockDeflLast
-                                unpcklps xmm3, xmm3
-                                // xmm0 = CFdefl[CFlast,0,1,2]
-                                movss xmm0, xmm4
-                                // xmm2 = CFdefl[0] - CFlast, CFdefl[1] - CFdefl[0], ...
-                                subps xmm2, xmm0
-                                // xmm4 = CFdefl[3,4,5]
-                                movups xmm4, xmmword ptr[eax + 12]
-                                // xmm1 = CFdefl[4,5]
-                                movlps xmm1, qword ptr[eax + 16]
-                                unpcklps xmm3, xmm3
-                                // xmm1 = CFdefl[4] - CFdefl[3], CFdefl[5] - CFdefl[4]
-                                subps xmm1, xmm4
-                                mulps xmm2, xmm3
-                                mulps xmm1, xmm3
-                                movaps xmmword ptr suspForceST[0], xmm2
-                                movlps qword ptr suspForceST[16], xmm1
-                            }
-                        else 
-                            suspForce = (CFshockDeflST[STmaxIdx] - CFshockDeflLast) * bumpsFactor * 0.25f;
-
-                        if (jetseat && jetseat->isEnabled()) {
-                            float CFd = CFshockDeflST[STmaxIdx] - CFshockDeflLast;
-                            if  (CFd > 0.0025f)
-                                jetseat->fBumpEffect(CFd * 220.0f, CFd * 220.0f);
-                        }
-
-                    }
-                    
-                    CFshockDeflLast = CFshockDeflST[STmaxIdx];
-
-                }
-
-                if (jetseat && jetseat->isEnabled() && LRshockDeflST != nullptr) {
-                    float LRd = LRshockDeflST[STmaxIdx] - LRshockDeflLast;
-                    float RRd = RRshockDeflST[STmaxIdx] - RRshockDeflLast;
-
-                    if (LRd > 0.0025f || RRd > 0.0025f)
-                        jetseat->rBumpEffect(LRd * 220.0f, RRd * 220.0f);
-
-                    LRshockDeflLast = LRshockDeflST[STmaxIdx];
-                    RRshockDeflLast = RRshockDeflST[STmaxIdx];
-                }
-
-                stopped = false;
-
+        while ((bRet = GetMessage(&msg, NULL, 0, 0)) != 0)
+        {
+            if (bRet == -1)
+            {
+                // handle the error and possibly exit
             }
             else
-                stopped = true;
-
-            if (*isOnTrack)
-                fan->setSpeed(*speed);
-
-            if (jetseat && jetseat->isEnabled() && *gear != lastGear) {
-                jetseat->gearEffect();
-                lastGear = *gear;
-            }
-
-            for (int i = 0; i < DIRECT_INTERP_SAMPLES; i++) {
-
-                yawFilter[i] = yaw * firc6[i];
-
-                yawForce[i] =
-                    yawFilter[0] + yawFilter[1] + yawFilter[2] +
-                        yawFilter[3] + yawFilter[4] + yawFilter[5];
-
-            }
-
-            halfSteerMax = *steerMax / 2.0f;
-            if (abs(halfSteerMax) < 8.0f && abs(*steer) > halfSteerMax - STOPS_MAXFORCE_RAD * 2.0f)
-                nearStops = true;
-            else
-                nearStops = false;
-
-            if (
-                !*isOnTrack ||
-                settings.getFfbType() == FFBTYPE_DIRECT_FILTER ||
-                settings.getFfbType() == FFBTYPE_DIRECT_FILTER_720
-            )
-                continue;
-
-            // Bump stops
-            if (abs(halfSteerMax) < 8.0f && abs(*steer) > halfSteerMax) {
-                
-                float factor, invFactor;
-
-                if (*steer > 0) {
-                    factor = (-(*steer - halfSteerMax)) / STOPS_MAXFORCE_RAD;
-                    factor = maxf(factor, -1.0f);
-                    invFactor = 1.0f + factor;
-                }
-                else {
-                    factor = (-(*steer + halfSteerMax)) / STOPS_MAXFORCE_RAD;
-                    factor = minf(factor, 1.0f);
-                    invFactor = 1.0f - factor;
-                }
-
-                setFFB((int)(factor * DI_MAX + scaleTorque(*swTorque) * invFactor));
-                continue;
-
-            }
-
-            // Telemetry FFB
-            switch (settings.getFfbType()) {
-
-                case FFBTYPE_360HZ: {
-
-                    for (int i = 0; i < STmaxIdx; i++) {
-                        setFFB(scaleTorque(swTorqueST[i] + suspForceST[i] + yawForce[i]));
-                        sleepSpinUntil(&start, 2000, 2760 * (i + 1));
-                    }
-                    setFFB(
-                        scaleTorque(
-                            swTorqueST[STmaxIdx] + suspForceST[STmaxIdx] + yawForce[STmaxIdx]
-                        )
-                    );
-
-                }
-                break;
-
-                case FFBTYPE_360HZ_INTERP: {
-
-                    float diff = (swTorqueST[0] - lastTorque) / 2.0f;
-                    float sdiff = (suspForceST[0] - lastSuspForce) / 2.0f;
-                    int force, iMax = STmaxIdx << 1;
-
-                    setFFB(
-                        scaleTorque(
-                            lastTorque + diff + lastSuspForce + sdiff + yawForce[0]
-                        )
-                    );
-
-                    for (int i = 0; i < iMax; i++) {
-
-                        int idx = i >> 1;
-
-                        if (i & 1) {
-                            diff = (swTorqueST[idx + 1] - swTorqueST[idx]) / 2.0f;
-                            sdiff = (suspForceST[idx + 1] - suspForceST[idx]) / 2.0f;
-                            force =
-                                scaleTorque(
-                                    swTorqueST[idx] + diff + suspForceST[idx] +
-                                        sdiff + yawForce[idx]
-                                );
-                        }
-                        else
-                            force =
-                                scaleTorque(
-                                    swTorqueST[idx] + suspForceST[idx] + yawForce[idx]
-                                );
-
-                        sleepSpinUntil(&start, 0, 1380 * (i + 1));
-                        setFFB(force);
-
-                    }
-
-                    sleepSpinUntil(&start, 0, 1380 * (iMax + 1));
-                    setFFB(
-                        scaleTorque(
-                            swTorqueST[STmaxIdx] + suspForceST[STmaxIdx] + yawForce[STmaxIdx]
-                        )
-                    );
-                    lastTorque = swTorqueST[STmaxIdx];
-                    lastSuspForce = suspForceST[STmaxIdx];
-
-                }
-                break;
-
-            }
-
-
-        }
-
-        // Did we lose iRacing?
-        if (hdr && numHandles > 0 && !(hdr->status & irsdk_stConnected)) {
-            debug(L"Disconnected from iRacing");
-            numHandles = 0;
-            dataLen = 0;
-            if (data != NULL) {
-                free(data);
-                data = NULL;
-            }
-            resetForces();
-            onTrack = false;
-            setOnTrackStatus(onTrack);
-            setConnectedStatus(false);
-            fan->setManualSpeed();
-            timeEndPeriod(1);
-            if (settings.getUseCarSpecific() && car[0] != 0) 
-                settings.writeSettingsForCar(car);
-        }
-
-        // Window messages
-        if (res == numHandles) {
-
-            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            {
                 if (msg.message == WM_QUIT)
                     DestroyWindow(mainWnd);
-                if (!IsDialogMessage(mainWnd, &msg)) {
-                    if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg)) {
-                        TranslateMessage(&msg);
-                        DispatchMessage(&msg);
-                    }
+                if (mainWnd == (HWND)NULL ||
+                    !IsDialogMessage(mainWnd, &msg) &&
+                    !TranslateAccelerator(msg.hwnd, hAccelTable,
+                        &msg))
+                {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
                 }
             }
-
         }
-
     }
 
     return (int)msg.wParam;
@@ -1355,14 +819,14 @@ HWND checkbox(HWND parent, wchar_t *name, int x, int y) {
 
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
 
-    DEV_BROADCAST_DEVICEINTERFACE devFilter;
+    //DEV_BROADCAST_DEVICEINTERFACE devFilter;
 
     hInst = hInstance;
 
     mainWnd = CreateWindowW(
         szWindowClass, szTitle,
         WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 864, 720,
+        CW_USEDEFAULT, CW_USEDEFAULT, 864, 470,
         NULL, NULL, hInst, NULL
     );
 
@@ -1378,37 +842,23 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     niData.uCallbackMessage = WM_TRAY_ICON;
     niData.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_SMALL));
 
-    settings.setDevWnd(combo(mainWnd, L"FFB device:", 44, 20));
-    settings.setFfbWnd(combo(mainWnd, L"FFB type:", 44, 80));
-    settings.setMinWnd(slider(mainWnd, L"Min force:", 44, 154, L"0", L"20", false));
-    settings.setMaxWnd(slider(mainWnd, L"Max force:", 44, 226, L"5 Nm", L"65 Nm", false));
-    settings.setDampingWnd(slider(mainWnd, L"Damping:", 44, 298, L"0", L"100", true));
-    settings.setBumpsWnd(slider(mainWnd, L"Suspension bumps:", 464, 40, L"0", L"100", true));
-    settings.setUndersteerWnd(slider(mainWnd, L"Understeer:", 464, 100, L"0", L"100", true));
-    settings.setUndersteerOffsetWnd(slider(mainWnd, L"Understeer offset:", 464, 160, L"0", L"100", true));
-    settings.setSopWnd(slider(mainWnd, L"SoP effect:", 464, 220, L"0", L"100", true));
-    settings.setSopOffsetWnd(slider(mainWnd, L"SoP offset:", 464, 280, L"0", L"100", true));
-    settings.setUse360Wnd(
-        checkbox(
-            mainWnd, 
-            L" Use 360 Hz telemetry for suspension effects\r\n in direct modes?",
-            460, 340
-        )
-    );
-    settings.setCarSpecificWnd(
-        checkbox(mainWnd, L" Use car specific settings?", 460, 400)
-    );
+    settings.setDevWnd(combo(mainWnd, L"FFB device:", 44, 10));
+    settings.setMaxWnd(slider(mainWnd, L"Overall Effect Strength:", 44, 80, L"0", L"100", false));
+    settings.setSopWnd(slider(mainWnd, L"SoP effect:", 464, 20, L"0", L"100", true));
+    settings.setSopOffsetWnd(slider(mainWnd, L"SoP offset:", 464, 80, L"0", L"100", true));
+    settings.setGLatWnd(slider(mainWnd, L"G effect:", 464, 140, L"0", L"100", true));
+
     settings.setReduceWhenParkedWnd(
-        checkbox(mainWnd, L" Reduce force when parked?", 460, 440)
+        checkbox(mainWnd, L" Reduce force when parked?", 460, 200)
     );
     settings.setRunOnStartupWnd(
-        checkbox(mainWnd, L" Run on startup?", 460, 480)
+        checkbox(mainWnd, L" Run on startup?", 460, 240)
     );
     settings.setStartMinimisedWnd(
-        checkbox(mainWnd, L" Start minimised?", 460, 520)
+        checkbox(mainWnd, L" Start minimised?", 460, 280)
     );
     settings.setDebugWnd(
-        checkbox(mainWnd, L"Debug logging?", 460, 560)
+        checkbox(mainWnd, L"Debug logging?", 460, 320)
     );
 
     int statusParts[] = { 256, 424, 864 };
@@ -1423,19 +873,13 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     textWnd = CreateWindowEx(
         WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_VISIBLE | WS_VSCROLL | WS_CHILD | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL,
-        32, 372, 376, 240,
+        32, 140, 376, 220,
         mainWnd, NULL, hInst, NULL
     );
     SendMessage(textWnd, EM_SETLIMITTEXT, WPARAM(256000), 0);
 
     ShowWindow(mainWnd, SW_HIDE);
     UpdateWindow(mainWnd);
-
-    memset(&devFilter, 0, sizeof(devFilter));
-    devFilter.dbcc_classguid = GUID_DEVINTERFACE_HID;
-    devFilter.dbcc_size = sizeof(devFilter);
-    devFilter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-    RegisterDeviceNotificationW(mainWnd, &devFilter, DEVICE_NOTIFY_WINDOW_HANDLE);
 
     return TRUE;
 
@@ -1458,15 +902,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 case IDM_EXIT:
                     DestroyWindow(hWnd);
                     break;
-                case ID_SETTINGS_JETSEAT:
-                    if (jetseat)
-                        jetseat->createWindow(hInst);
-                    break;
-                case ID_SETTINGS_FAN:
-                    fan->createWindow(hInst);
-                    break;
-                case ID_SETTINGS_HIDGUARDIAN:
-                    hidGuardian->createWindow(hInst);
                 default:
                     if (HIWORD(wParam) == CBN_SELCHANGE) {
                         if (wnd == settings.getDevWnd()) {
@@ -1475,22 +910,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                             if (oldDevice != GUID_NULL)
                                 vidpid = getDeviceVidPid(ffdevice); 
                             settings.setFfbDevice(SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0));
-                            if (vidpid != 0 && oldDevice != settings.getFfbDevice())
-                                hidGuardian->removeDevice(LOWORD(vidpid), HIWORD(vidpid), false);
                         }
-                        else if (wnd == settings.getFfbWnd())
-                            settings.setFfbType(SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0));
                     }
                     else if (HIWORD(wParam) == BN_CLICKED) {
                         bool oldValue = SendMessage((HWND)lParam, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                        if (wnd == settings.getUse360Wnd())
-                            settings.setUse360ForDirect(!oldValue);
-                        else if (wnd == settings.getCarSpecificWnd()) {
-                            if (!oldValue)
-                                getCarName();
-                            settings.setUseCarSpecific(!oldValue, car);
-                        }
-                        else if (wnd == settings.getReduceWhenParkedWnd())
+                        if (wnd == settings.getReduceWhenParkedWnd())
                             settings.setReduceWhenParked(!oldValue);
                         else if (wnd == settings.getRunOnStartupWnd())
                             settings.setRunOnStartup(!oldValue);
@@ -1526,12 +950,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         case WM_EDIT_VALUE: {
             if (wnd == settings.getMaxWnd()->value)
                 settings.setMaxForce(wParam, wnd);
-            else if (wnd == settings.getMinWnd()->value)
-                settings.setMinForce(wParam, wnd);
-            else if (wnd == settings.getBumpsWnd()->value)
-                settings.setBumpsFactor(reinterpret_cast<float &>(wParam), wnd);
-            else if (wnd == settings.getDampingWnd()->value)
-                settings.setDampingFactor(reinterpret_cast<float &>(wParam), wnd);
+            else if (wnd == settings.getGLatWnd()->value)
+                settings.setGLatFactor(reinterpret_cast<float&>(wParam), wnd);
             else if (wnd == settings.getSopWnd()->value)
                 settings.setSopFactor(reinterpret_cast<float &>(wParam), wnd);
             else if (wnd == settings.getSopOffsetWnd()->value)
@@ -1543,20 +963,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         case WM_HSCROLL: {
             if (wnd == settings.getMaxWnd()->trackbar)
                 settings.setMaxForce(SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
-            else if (wnd == settings.getMinWnd()->trackbar)
-                settings.setMinForce(SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
-            else if (wnd == settings.getBumpsWnd()->trackbar)
-                settings.setBumpsFactor((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
-            else if (wnd == settings.getDampingWnd()->trackbar)
-                settings.setDampingFactor((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
+            else if (wnd == settings.getGLatWnd()->trackbar)
+                settings.setGLatFactor((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
             else if (wnd == settings.getSopWnd()->trackbar)
                 settings.setSopFactor((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
             else if (wnd == settings.getSopOffsetWnd()->trackbar)
                 settings.setSopOffset((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
-            else if (wnd == settings.getUndersteerWnd()->trackbar)
-                settings.setUndersteerFactor((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
-            else if (wnd == settings.getUndersteerOffsetWnd()->trackbar)
-                settings.setUndersteerOffset((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
         }
         break;
 
@@ -1650,7 +1062,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             else
                 settings.writeGenericSettings();
             settings.writeRegSettings();
-            hidGuardian->stop(GetCurrentProcessId());
             if (debugHnd != INVALID_HANDLE_VALUE)
                 CloseHandle(debugHnd);
             CloseHandle(globalMutex);
@@ -1781,7 +1192,7 @@ void setConnectedStatus(bool connected) {
 
     SendMessage(
         statusWnd, SB_SETTEXT, STATUS_CONNECTED_PART,
-        LPARAM(connected ? L"iRacing connected" : L"iRacing disconnected")
+        LPARAM(connected ? L"ACC connected" : L"ACC disconnected")
     );
 
 }
@@ -2052,9 +1463,6 @@ void initDirectInput() {
 
     LeaveCriticalSection(&effectCrit);
 
-    if (vidpid != 0)
-        hidGuardian->setDevice(LOWORD(vidpid), HIWORD(vidpid));
-
 }
 
 void releaseDirectInput() {
@@ -2109,19 +1517,6 @@ void reacquireDIDevice() {
 
 }
 
-inline void sleepSpinUntil(PLARGE_INTEGER base, UINT sleep, UINT offset) {
-
-    LARGE_INTEGER time;
-    LONGLONG until = base->QuadPart + (offset * freq.QuadPart) / 1000000;
-
-    std::this_thread::sleep_for(std::chrono::microseconds(sleep));
-    do {
-        _asm { pause };
-        QueryPerformanceCounter(&time);
-    } while (time.QuadPart < until);
-
-}
-
 inline int scaleTorque(float t) {
 
     return (int)(t * settings.getScaleFactor());
@@ -2133,26 +1528,19 @@ inline void setFFB(int mag) {
     if (!effect)
         return;
 
-    if (mag <= -IR_MAX) {
-        mag = -IR_MAX;
+    if (mag <= -DI_MAX) {
+        mag = -DI_MAX;
         clippedSamples++;
     }
-    else if (mag >= IR_MAX) {
-        mag = IR_MAX;
+    else if (mag >= DI_MAX) {
+        mag = DI_MAX;
         clippedSamples++;
     }
 
     samples++;
-    int minForce = settings.getMinForce();
 
     if (stopped && settings.getReduceWhenParked())
         mag /= 4;
-    else if (minForce) {
-        if (mag > 0 && mag < minForce)
-            mag = minForce;
-        else if (mag < 0 && mag > -minForce)
-            mag = -minForce;
-    }
 
     ffbMag = mag;
 
@@ -2257,11 +1645,6 @@ void releaseAll() {
 
     releaseDirectInput();
 
-    if (fan)
-        fan->setSpeed(0);
-
     RelinquishVJD(vjDev);
-
-    irsdk_shutdown();
 
 }
