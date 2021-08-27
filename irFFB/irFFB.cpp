@@ -349,6 +349,8 @@ DWORD WINAPI directFFBThread(LPVOID lParam) {
     float lastSuspForce = 0, lastYawForce = 0;
     float yaw = 0.0f;
     float gLat = 0.0f;
+    float wheelSlip = 0.0f;
+    float wheelSlipTH = 0.95f;
 
     float maxValue = 10000.0f;
 
@@ -365,7 +367,7 @@ DWORD WINAPI directFFBThread(LPVOID lParam) {
         mag = (ffbPacket.data[3] << 8) + ffbPacket.data[2];
         force = mag;
 
-        s = (float)force;
+        s = (float)force / maxValue;
 
         SPageFilePhysics* pfPhys = (SPageFilePhysics*)m_physics.mapFileBuffer;
         SPageFileGraphic* pfGfx = (SPageFileGraphic*)m_graphics.mapFileBuffer;
@@ -387,64 +389,45 @@ DWORD WINAPI directFFBThread(LPVOID lParam) {
         gLat = 0.0f;
 
         float bumpsFactor = settings.getBumpsFactor();
-        float sopFactor = (settings.getSopFactor() * maxValue / 100.0f);
-        float gLatFactor = (settings.getGLatFactor() * maxValue / 100.0f);
-        float sopOffset = settings.getSopOffset();
+        float sopFactor = settings.getSopFactor() / 100.0f;
+        float gLatFactor = settings.getGLatFactor() / 100.0f;
+        float sopOffset = settings.getSopOffset() / 10.0f;
+        float wheelSlipFactor = settings.getUndersteerFactor() / 100.0f;
 
         if (pfPhys->speedKmh > 2.0f) {
 
             if (pfPhys->speedKmh > 5.0f) {
 
-                float halfMaxForce = maxValue / 1.2f;
-                float r = pfPhys->localVelocity[0] / pfPhys->localVelocity[2];
-                float sa, asa, ar = abs(r);
-
-                if (pfPhys->localVelocity[2] < 0.0f)
-                    r = -r;
-
-                if (ar > 1.0f) {
-                    sa = csignf(0.785f, r);
-                    asa = 0.785f;
-                    yaw = minf(maxf(sa * sopFactor, -halfMaxForce), halfMaxForce);
+                if (wheelSlipFactor > 0.0f)
+                {
+                    float ws = (pfPhys->wheelSlip[0] + pfPhys->wheelSlip[1]) / 2.0f;
+                    if (ws > wheelSlipTH)
+                        ws = ws - wheelSlipTH;
+                    else
+                        ws = 0.0f;
+                    wheelSlip = (2.0f * wheelSlipFactor) / (1.0f + expf(-10.0f * ws)) - wheelSlipFactor;
                 }
-                else {
-                    sa = 0.78539816339745f * r + 0.273f * r * (1.0f - ar);
-                    asa = abs(sa);
-                    if (asa > sopOffset) {
-                        sa -= csignf(sopOffset, sa);
-                        yaw =
-                            minf(
-                                maxf(
-                                    sa * (1.785f - asa) * sopFactor,
-                                    -halfMaxForce
-                                ),
-                                halfMaxForce
-                            );
-                    }
+                
+                if (sopFactor > 0.0f)
+                {
+                    float r = (2 * pfPhys->localVelocity[0]) / pfPhys->localVelocity[2];
+                    if (pfPhys->localVelocity[2] < 0.0f)
+                        r = -r;
+
+                    yaw = (2.0f * sopFactor) / (1.0f + expf(-sopOffset / sopFactor * r)) - sopFactor;
+
+                    float sgn = csignf(1.0f, yaw);
+                    yaw = minf(fabsf(yaw), fabsf(pfPhys->accG[0] / 1.0f));
+                    yaw = csignf(yaw, sgn);
                 }
 
-                r = -pfPhys->accG[0] / 2.0f;
-                ar = abs(r);
+                if (gLatFactor > 0.0f)
+                {
+                    float r = -pfPhys->accG[0] / 2.6f;
+                    if (pfPhys->localVelocity[2] < 0.0f)
+                        r = -r;
 
-                if (pfPhys->localVelocity[2] < 0.0f)
-                    r = -r;
-
-                if (ar > 1.0f) {
-                    sa = csignf(0.785f, r);
-                    asa = 0.785f;
-                    gLat = minf(maxf(sa * gLatFactor, -halfMaxForce), halfMaxForce);
-                }
-                else {
-                    sa = 0.78539816339745f * r + 0.273f * r * (1.0f - ar);
-                    asa = abs(sa);
-                    gLat =
-                        minf(
-                            maxf(
-                                sa * (1.785f - asa) * gLatFactor,
-                                -halfMaxForce
-                            ),
-                            halfMaxForce
-                        );
+                    gLat = (2.0f * gLatFactor) / (1.0f + expf(-2.3f * r)) - gLatFactor;
                 }
 
             }
@@ -455,23 +438,18 @@ DWORD WINAPI directFFBThread(LPVOID lParam) {
         else
             stopped = true;
 
-        float forces = ((yaw + gLat) * settings.getScaleFactor() + s) / maxValue;
+        float forces = (yaw + gLat) * settings.getScaleFactor() + s;
 
-        float sigma;
-        float sign = 1.0f;
-        if (forces < 0.0f)
-            sign = -1.0f;
+        float sign = csignf(1.0f, forces);
 
-        float gLong = pfPhys->accG[2];
+        float gLong = -pfPhys->accG[2];
 
-        if (gLong < 0)
-            gLong *= 0.5;
-
-        gLong *= settings.getGLatFactor() / -260.0f;
+        gLong = ((1.2f * gLatFactor) / (1.0f + expf(-2.3f * (gLong - 0.7f))) - 0.2f * gLatFactor) / 2.0f;
 
         forces = fabsf(forces);
-        sigma = 2.0f / (1.0f + pow(2.718f, -15.0f * forces)) - 1.0f;
-        forces = sign * (((1.0f - sigma) * forces) + (sigma * (pow(forces, 1.0f / (1.0f + gLong)))));
+        float sig = 2.0f / (1.0f + powf(2.718f, -15.0f * forces)) - 1.0f;
+        forces = sign * (((1.0f - sig) * forces) + (sig * (powf(forces, 1.0f / (1.0f + gLong)))));
+        forces *= 1.0f - 0.5f * wheelSlip;
 
         r = (int)(forces * maxValue);
 
@@ -826,7 +804,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     mainWnd = CreateWindowW(
         szWindowClass, szTitle,
         WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 864, 470,
+        CW_USEDEFAULT, CW_USEDEFAULT, 864, 500,
         NULL, NULL, hInst, NULL
     );
 
@@ -845,20 +823,21 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     settings.setDevWnd(combo(mainWnd, L"FFB device:", 44, 10));
     settings.setMaxWnd(slider(mainWnd, L"Overall Effect Strength:", 44, 80, L"0", L"100", false));
     settings.setSopWnd(slider(mainWnd, L"SoP effect:", 464, 20, L"0", L"100", true));
-    settings.setSopOffsetWnd(slider(mainWnd, L"SoP offset:", 464, 80, L"0", L"100", true));
+    settings.setSopOffsetWnd(slider(mainWnd, L"SoP attack:", 464, 80, L"0", L"100", true));
     settings.setGLatWnd(slider(mainWnd, L"G effect:", 464, 140, L"0", L"100", true));
+    settings.setUndersteerWnd(slider(mainWnd, L"Understeer effect:", 464, 200, L"0", L"100", true));
 
-    settings.setReduceWhenParkedWnd(
-        checkbox(mainWnd, L" Reduce force when parked?", 460, 200)
-    );
+    //settings.setReduceWhenParkedWnd(
+    //    checkbox(mainWnd, L" Reduce force when parked?", 460, 200)
+    //);
     settings.setRunOnStartupWnd(
-        checkbox(mainWnd, L" Run on startup?", 460, 240)
+        checkbox(mainWnd, L" Run on startup?", 460, 260)
     );
     settings.setStartMinimisedWnd(
-        checkbox(mainWnd, L" Start minimised?", 460, 280)
+        checkbox(mainWnd, L" Start minimised?", 460, 300)
     );
     settings.setDebugWnd(
-        checkbox(mainWnd, L"Debug logging?", 460, 320)
+        checkbox(mainWnd, L"Debug logging?", 460, 340)
     );
 
     int statusParts[] = { 256, 424, 864 };
@@ -873,7 +852,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     textWnd = CreateWindowEx(
         WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_VISIBLE | WS_VSCROLL | WS_CHILD | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL,
-        32, 140, 376, 220,
+        32, 160, 376, 240,
         mainWnd, NULL, hInst, NULL
     );
     SendMessage(textWnd, EM_SETLIMITTEXT, WPARAM(256000), 0);
@@ -955,7 +934,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             else if (wnd == settings.getSopWnd()->value)
                 settings.setSopFactor(reinterpret_cast<float &>(wParam), wnd);
             else if (wnd == settings.getSopOffsetWnd()->value)
-                settings.setSopOffset(reinterpret_cast<float &>(wParam), wnd);
+                settings.setSopOffset(reinterpret_cast<float&>(wParam), wnd);
+            else if (wnd == settings.getUndersteerWnd()->value)
+                settings.setUndersteerFactor(reinterpret_cast<float&>(wParam), wnd);
         }
         break;
              
@@ -969,6 +950,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 settings.setSopFactor((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
             else if (wnd == settings.getSopOffsetWnd()->trackbar)
                 settings.setSopOffset((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
+            else if (wnd == settings.getUndersteerWnd()->trackbar)
+                settings.setUndersteerFactor((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
         }
         break;
 

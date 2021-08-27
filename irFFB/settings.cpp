@@ -95,6 +95,7 @@ void Settings::setMaxWnd(sWins_t *wnd) {
 }
 
 void Settings::setGLatWnd(sWins_t* wnd) { gLatWnd = wnd; }
+void Settings::setUndersteerWnd(sWins_t* wnd) { understeerWnd = wnd; }
 void Settings::setSopWnd(sWins_t *wnd) { sopWnd = wnd; }
 void Settings::setSopOffsetWnd(sWins_t *wnd) { sopOffsetWnd = wnd; }
 void Settings::setReduceWhenParkedWnd(HWND wnd) { reduceWhenParkedWnd = wnd; }
@@ -161,6 +162,19 @@ bool Settings::setGLatFactor(float factor, HWND wnd) {
     return true;
 }
 
+bool Settings::setUndersteerFactor(float factor, HWND wnd) {
+    if (factor < 0.0f || factor > 100.0f)
+        return false;
+    understeerFactor = factor;
+    if (wnd != understeerWnd->trackbar)
+        SendMessage(understeerWnd->trackbar, TBM_SETPOS, TRUE, (int)factor);
+    if (wnd != understeerWnd->value) {
+        swprintf_s(strbuf, L"%.1f", factor);
+        SendMessage(understeerWnd->value, WM_SETTEXT, NULL, LPARAM(strbuf));
+    }
+    return true;
+}
+
 bool Settings::setSopFactor(float factor, HWND wnd) {
     if (factor < 0.0f || factor > 100.0f)
         return false;
@@ -178,7 +192,7 @@ bool Settings::setSopFactor(float factor, HWND wnd) {
 bool Settings::setSopOffset(float offset, HWND wnd) {
     if (offset < 0.0f || offset > 100.0f)
         return false;
-    sopOffset = offset / 572.958f;
+    sopOffset = offset;
     if (wnd != sopOffsetWnd->trackbar)
         SendMessage(sopOffsetWnd->trackbar, TBM_SETPOS, TRUE, (int)offset);
     if (wnd != sopOffsetWnd->value) {
@@ -230,7 +244,7 @@ void Settings::setDebug(bool enabled) {
 }
 
 float Settings::getSopOffsetSetting() {
-    return sopOffset * 572.958f;
+    return sopOffset;
 }
 
 void Settings::readRegSettings(char *car) {
@@ -270,6 +284,7 @@ void Settings::readGenericSettings() {
         setGLatFactor(0.0f, (HWND)-1);
         setSopFactor(0.0f, (HWND)-1);
         setSopOffset(0.0f, (HWND)-1);
+        setUndersteerFactor(0.0f, (HWND)-1);
         return;
     }
 
@@ -277,6 +292,7 @@ void Settings::readGenericSettings() {
     setGLatFactor(getRegSetting(key, L"gLatFactor", 0.0f), (HWND)-1);
     setSopFactor(getRegSetting(key, L"yawFactor", 0.0f), (HWND)-1);
     setSopOffset(getRegSetting(key, L"yawOffset", 0.0f), (HWND)-1);
+    setUndersteerFactor(getRegSetting(key, L"usteerFactor", 0.0f), (HWND)-1);
 
     RegCloseKey(key);
 
@@ -312,6 +328,7 @@ void Settings::writeGenericSettings() {
         return;
 
     setRegSetting(key, L"gLatFactor", gLatFactor);
+    setRegSetting(key, L"usteerFactor", understeerFactor);
     setRegSetting(key, L"yawFactor", sopFactor);
     setRegSetting(key, L"yawOffset", getSopOffsetSetting());
     setRegSetting(key, L"maxForce", maxForce);
