@@ -89,6 +89,7 @@ bool onTrack = false, stopped = true, deviceChangePending = false, logiWheel = f
 
 volatile int ffbMag = 0;
 volatile bool nearStops = false;
+volatile float speedKmh = 0.0f;
 
 int numButtons = 0, numPov = 0, vjButtons = 0, vjPov = 0;
 UINT samples, clippedSamples;
@@ -187,6 +188,7 @@ DWORD WINAPI readWheelThread(LPVOID lParam) {
     float d = 0.0f;
 
     lastTime.QuadPart = 0;
+    elapsed.QuadPart = 0;
 
     while (true) {
 
@@ -259,19 +261,28 @@ DWORD WINAPI readWheelThread(LPVOID lParam) {
 
                 d = (fd[0] + fd[1] + fd[2] + fd[3]) / 4.0f;
 
-                if (nearStops)
-                    d *= DAMPING_MULTIPLIER_STOPS;
+                //if (nearStops)
+                //    d *= DAMPING_MULTIPLIER_STOPS;
+                //else
+                float speedFactor = 0.0f;
+                if (speedKmh > 5.0f)
+                    speedFactor = speedKmh / 300.0f;
                 else
-                    d *= DAMPING_MULTIPLIER * settings.getDampingFactor();
+                    speedFactor = (5.0f - speedKmh) / 2.5f;
+                speedFactor += 0.2f;
 
+                d *= DAMPING_MULTIPLIER * settings.getDampingFactor() * speedFactor;
+
+                debug(L"Elapsed: %f SteeringPos: %d LastPos: %d Damping: %f", (float)elapsed.QuadPart, joyState.lX, lastX, d);
             }
             else
                 d = 0.0f;
 
         }
 
+        debug(L"Damping: %f", d);
         pforce.lOffset = ffbMag;
-        //pforce.lOffset += (int)d;
+        pforce.lOffset += (int)d;
 
         if (pforce.lOffset > DI_MAX)
             pforce.lOffset = DI_MAX;
@@ -344,15 +355,27 @@ DWORD WINAPI directFFBThread(LPVOID lParam) {
     UNREFERENCED_PARAMETER(lParam);
     int16_t mag;
 
+    static float ssv = 0.0f;
+    static int lastPacketId = 0;
+
     float s;
     int r;
     float lastSuspForce = 0, lastYawForce = 0;
-    float yaw = 0.0f;
-    float gLat = 0.0f;
-    float wheelSlip = 0.0f;
+    static float yaw = 0.0f;
+    static float gLat = 0.0f;
+    static float wheelSlip = 0.0f;
     float wheelSlipTH = 0.95f;
+    float steerPos;
 
     float maxValue = 10000.0f;
+
+    LARGE_INTEGER lastTime, time, elapsed;
+    float vel[DIRECT_INTERP_SAMPLES] = { 0.0f }, fd[4] = { 0.0f };
+    int velIdx = 0, vi = 0, fdIdx = 0;
+    float lastX = 0.0f;
+
+    lastTime.QuadPart = 0;
+    elapsed.QuadPart = 0;
 
     constexpr auto PI = 3.14159265;
 
@@ -372,6 +395,9 @@ DWORD WINAPI directFFBThread(LPVOID lParam) {
         SPageFilePhysics* pfPhys = (SPageFilePhysics*)m_physics.mapFileBuffer;
         SPageFileGraphic* pfGfx = (SPageFileGraphic*)m_graphics.mapFileBuffer;
 
+        steerPos = pfPhys->steerAngle;
+        speedKmh = pfPhys->speedKmh;
+
         if (onTrack && pfGfx->isInPit) {
             debug(L"No longer on track");
             onTrack = false;
@@ -385,58 +411,64 @@ DWORD WINAPI directFFBThread(LPVOID lParam) {
             setOnTrackStatus(onTrack);
         }
 
-        yaw = 0.0f;
-        gLat = 0.0f;
-
         float bumpsFactor = settings.getBumpsFactor();
         float sopFactor = settings.getSopFactor() / 100.0f;
         float gLatFactor = settings.getGLatFactor() / 100.0f;
         float sopOffset = settings.getSopOffset() / 10.0f;
         float wheelSlipFactor = settings.getUndersteerFactor() / 100.0f;
 
-        if (pfPhys->speedKmh > 2.0f) {
+        if (speedKmh > 2.0f) {
 
-            if (pfPhys->speedKmh > 5.0f) {
+            if (speedKmh > 5.0f) {
 
-                if (wheelSlipFactor > 0.0f)
+                if (lastPacketId != pfPhys->packetId)
                 {
-                    float ws = (pfPhys->wheelSlip[0] + pfPhys->wheelSlip[1]) / 2.0f;
-                    if (ws > wheelSlipTH)
-                        ws = ws - wheelSlipTH;
-                    else
-                        ws = 0.0f;
-                    wheelSlip = (2.0f * wheelSlipFactor) / (1.0f + expf(-10.0f * ws)) - wheelSlipFactor;
+                    if (wheelSlipFactor > 0.0f)
+                    {
+                        float ws = (pfPhys->wheelSlip[0] + pfPhys->wheelSlip[1]) / 2.0f;
+                        if (ws > wheelSlipTH)
+                            ws = ws - wheelSlipTH;
+                        else
+                            ws = 0.0f;
+                        wheelSlip = (2.0f * wheelSlipFactor) / (1.0f + expf(-10.0f * ws)) - wheelSlipFactor;
+                    }
+
+                    if (sopFactor > 0.0f)
+                    {
+                        float r = (2 * pfPhys->localVelocity[0]) / pfPhys->localVelocity[2];
+                        if (pfPhys->localVelocity[2] < 0.0f)
+                            r = -r;
+
+                        yaw = (2.0f * sopFactor) / (1.0f + expf(-sopOffset / sopFactor * r)) - sopFactor;
+
+                        float sgn = csignf(1.0f, yaw);
+                        yaw = minf(fabsf(yaw), fabsf(pfPhys->accG[0] / 1.0f));
+                        yaw = csignf(yaw, sgn);
+                    }
+
+                    if (gLatFactor > 0.0f)
+                    {
+                        float r = -pfPhys->accG[0] / 2.6f;
+                        if (pfPhys->localVelocity[2] < 0.0f)
+                            r = -r;
+
+                        gLat = (2.0f * gLatFactor) / (1.0f + expf(-2.3f * r)) - gLatFactor;
+                    }
+
+                    lastPacketId = pfPhys->packetId;
                 }
-                
-                if (sopFactor > 0.0f)
-                {
-                    float r = (2 * pfPhys->localVelocity[0]) / pfPhys->localVelocity[2];
-                    if (pfPhys->localVelocity[2] < 0.0f)
-                        r = -r;
-
-                    yaw = (2.0f * sopFactor) / (1.0f + expf(-sopOffset / sopFactor * r)) - sopFactor;
-
-                    float sgn = csignf(1.0f, yaw);
-                    yaw = minf(fabsf(yaw), fabsf(pfPhys->accG[0] / 1.0f));
-                    yaw = csignf(yaw, sgn);
-                }
-
-                if (gLatFactor > 0.0f)
-                {
-                    float r = -pfPhys->accG[0] / 2.6f;
-                    if (pfPhys->localVelocity[2] < 0.0f)
-                        r = -r;
-
-                    gLat = (2.0f * gLatFactor) / (1.0f + expf(-2.3f * r)) - gLatFactor;
-                }
-
             }
 
             stopped = false;
 
         }
-        else
+        else {
             stopped = true;
+            gLat = 0.0f;
+            yaw = 0.0f;
+            wheelSlip = 0.0f;
+            ssv = 0.0f;
+        }
 
         float forces = (yaw + gLat) * settings.getScaleFactor() + s;
 
@@ -451,7 +483,8 @@ DWORD WINAPI directFFBThread(LPVOID lParam) {
         forces = sign * (((1.0f - sig) * forces) + (sig * (powf(forces, 1.0f / (1.0f + gLong)))));
         forces *= 1.0f - 0.5f * wheelSlip;
 
-        r = (int)(forces * maxValue);
+
+        r = (int)((forces + ssv * 1.0f) * maxValue);
 
         setFFB(r);
     }
@@ -822,6 +855,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
 
     settings.setDevWnd(combo(mainWnd, L"FFB device:", 44, 10));
     settings.setMaxWnd(slider(mainWnd, L"Overall Effect Strength:", 44, 80, L"0", L"100", false));
+    settings.setDampingWnd(slider(mainWnd, L"Damping:", 44, 140, L"0", L"100", false));
     settings.setSopWnd(slider(mainWnd, L"SoP effect:", 464, 20, L"0", L"100", true));
     settings.setSopOffsetWnd(slider(mainWnd, L"SoP attack:", 464, 80, L"0", L"100", true));
     settings.setGLatWnd(slider(mainWnd, L"G effect:", 464, 140, L"0", L"100", true));
@@ -852,7 +886,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     textWnd = CreateWindowEx(
         WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_VISIBLE | WS_VSCROLL | WS_CHILD | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL,
-        32, 160, 376, 240,
+        32, 220, 376, 160,
         mainWnd, NULL, hInst, NULL
     );
     SendMessage(textWnd, EM_SETLIMITTEXT, WPARAM(256000), 0);
@@ -929,6 +963,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         case WM_EDIT_VALUE: {
             if (wnd == settings.getMaxWnd()->value)
                 settings.setMaxForce(wParam, wnd);
+            else if (wnd == settings.getDampingWnd()->value)
+                settings.setDampingFactor(reinterpret_cast<float&>(wParam), wnd);
             else if (wnd == settings.getGLatWnd()->value)
                 settings.setGLatFactor(reinterpret_cast<float&>(wParam), wnd);
             else if (wnd == settings.getSopWnd()->value)
@@ -944,6 +980,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         case WM_HSCROLL: {
             if (wnd == settings.getMaxWnd()->trackbar)
                 settings.setMaxForce(SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
+            else if (wnd == settings.getDampingWnd()->trackbar)
+                settings.setDampingFactor((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
             else if (wnd == settings.getGLatWnd()->trackbar)
                 settings.setGLatFactor((float)SendMessage(wnd, TBM_GETPOS, 0, 0), wnd);
             else if (wnd == settings.getSopWnd()->trackbar)
